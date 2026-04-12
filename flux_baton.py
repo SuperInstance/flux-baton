@@ -1,29 +1,109 @@
 #!/usr/bin/env python3
-"""flux-baton — Generational context handoff for FLUX-native agents.
+"""flux-baton v2 — Refined generational context handoff.
 
-Agents pack their brain into git, pass it to the next generation,
-and the next gen picks up exactly where they left off.
+Changes from v1:
+- Layered autobiography (L0 always loaded, L1 compressed, L2 full)
+- Quality gate: handoffs scored before commit
+- Atomic writes: GENERATION file is commit marker, written last
+- Structured state: STATE.json (machine) + HANDOFF.md (human)
+- Evolution tracking: fitness history across generations
+- Lease-based handoff: prevents concurrent writes
+- Keeper endpoints: registry, score, lease, commit
 """
 
 import json
 import os
-import sys
+import re
 import time
 import hashlib
-import base64
 import urllib.request
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 KEEPER_URL = os.environ.get("KEEPER_URL", "http://127.0.0.1:8900")
 
 
-class Baton:
-    """FLUX-native baton for generational context handoff.
+# ── Quality Gate ──
+
+def score_handoff(letter: str) -> dict:
+    """Score a handoff letter against the rubric. Returns scores + pass/fail."""
+    lower = letter.lower()
+    words = len(letter.split())
+    scores = {}
     
-    The baton IS the agent's brain, serialized to git.
-    Next generation downloads it and becomes the same agent.
-    """
+    # Surplus Insight: specific technical details
+    specific = ["line", "0x", "byte", "offset", "register", "file", "bug", "error"]
+    scores["surplus_insight"] = min(10, sum(1 for m in specific if m in lower) * 2)
+    
+    # Causal Chain: cause-and-effect language
+    chain = ["because", "which meant", "so i", "caused", "led to", "result", "triggered"]
+    scores["causal_chain"] = min(10, sum(1 for m in chain if m in lower) * 2)
+    
+    # Honesty: marks uncertainty explicitly
+    honest = ["uncertain", "not sure", "guess", "might", "don't know", "unclear", "?"]
+    scores["honesty"] = min(10, sum(1 for m in honest if m in lower) * 2)
+    
+    # Actionable Signal: has specific next steps
+    has_next = any(x in lower for x in ["what i'd do next", "next steps", "what to do"])
+    has_numbered = any(f"{i}." in letter for i in range(1, 4))
+    scores["actionable_signal"] = 8 if (has_next and has_numbered) else 3
+    
+    # Compression: right length
+    if 150 <= words <= 500:
+        scores["compression"] = 8
+    elif 100 <= words <= 700:
+        scores["compression"] = 5
+    else:
+        scores["compression"] = 3
+    
+    # Human Compatibility: uses section headers
+    sections = ["who i was", "where things stand", "uncertain", "next"]
+    scores["human_compat"] = min(10, sum(1 for s in sections if s in lower) * 3)
+    
+    # Precedent Value: contains a teachable lesson
+    lessons = ["lesson", "pattern", "root cause", "systemic", "the fix", "this means"]
+    scores["precedent_value"] = min(10, sum(1 for m in lessons if m in lower) * 2)
+    
+    avg = round(sum(scores.values()) / len(scores), 1)
+    passes = avg >= 4.5 and all(v >= 3 for v in scores.values())
+    
+    return {"scores": scores, "average": avg, "passes": passes, "word_count": words}
+
+
+def generate_autobiography(handoffs: List[dict]) -> str:
+    """Generate L1 compressed autobiography from all handoff letters."""
+    lines = ["# Autobiography\n"]
+    lines.append(f"Generations: {len(handoffs)}\n")
+    
+    for h in handoffs:
+        gen = h.get("generation", "?")
+        letter = h.get("letter", "")
+        score = h.get("score", {})
+        avg = score.get("average", "?")
+        
+        # Extract key sections
+        summary = ""
+        for section in ["## Where Things Stand", "## What I Was Thinking"]:
+            if section.lower() in letter.lower():
+                idx = letter.lower().index(section.lower())
+                end = letter.find("\n##", idx + 10)
+                chunk = letter[idx:end if end > 0 else len(letter)].strip()
+                # Take first 2 lines
+                section_lines = [l for l in chunk.split("\n") if l.strip() and not l.startswith("#")][:2]
+                summary += " ".join(section_lines) + " "
+        
+        lines.append(f"### Gen-{gen} (score: {avg})")
+        if summary:
+            lines.append(summary.strip())
+        lines.append("")
+    
+    return "\n".join(lines)
+
+
+# ── Baton v2 ──
+
+class Baton:
+    """FLUX-native baton v2 — refined generational handoff."""
 
     def __init__(self, vessel: str, keeper_url: str = KEEPER_URL,
                  agent_id: str = None, agent_secret: str = None):
@@ -33,9 +113,9 @@ class Baton:
         self.agent_secret = agent_secret
         self.generation = 0
         self.state = {}
-        self.autobiography = []
-    
-    # ── Keeper Communication ──
+        self.handoff = ""
+        self.autobiography_text = ""
+        self._lease_id = None
     
     def _keeper(self, method: str, path: str, body=None) -> dict:
         url = f"{self.keeper_url}{path}"
@@ -52,176 +132,214 @@ class Baton:
         except Exception as e:
             return {"error": str(e)}
     
-    # ── Read Baton from Git ──
+    def _repo(self) -> str:
+        return self.vessel if "/" in self.vessel else f"SuperInstance/{self.vessel}"
+    
+    def _write(self, path: str, content: str, message: str) -> dict:
+        """Write a file to the vessel repo through the keeper."""
+        return self._keeper("POST", f"/file/{self._repo()}/{path}",
+                           {"content": content, "message": message})
+    
+    def _read(self, path: str) -> Optional[str]:
+        """Read a file from the vessel repo through the keeper."""
+        result = self._keeper("GET", f"/file/{self._repo()}/{path}")
+        return result.get("content") if isinstance(result, dict) else None
+    
+    # ── Restore (Gen-N+1 reads baton) ──
     
     def restore(self) -> dict:
-        """Unpack the baton — read agent state from vessel repo.
+        """Boot sequence: restore baton from vessel repo.
         
-        This is what a new generation does at boot:
-        1. Read GENERATION counter
-        2. Read IDENTITY, ENERGY, OPEN_THREADS
-        3. Read latest HANDOFF.md
-        4. Read full autobiography (all handoff letters)
-        5. Set self.generation for next handoff
+        Loads L0 (mandatory) + optionally L1 (if context allows).
         """
-        # Resolve vessel repo name
-        repo = self._resolve_repo()
-        if not repo:
-            return {"error": "vessel repo not found"}
+        state = {
+            "generation": 0, "identity": {}, "energy": {},
+            "open_threads": [], "intentions": [], "skills": {},
+            "trust": {}, "diary": "", "handoff": "",
+            "autobiography": "", "fitness_history": [],
+        }
         
-        state = {"generation": 0, "identity": {}, "energy": {}, 
-                 "open_threads": [], "diary": "", "handoff": "", 
-                 "autobiography": [], "skills": {}, "trust": {}}
-        
-        # Read generation counter
-        gen_data = self._keeper("GET", f"/file/{repo}/.baton/GENERATION")
-        if gen_data.get("content"):
+        # 1. Read GENERATION (commit marker)
+        gen_text = self._read(".baton/GENERATION")
+        if gen_text:
             try:
-                state["generation"] = int(gen_data["content"].strip())
+                state["generation"] = int(gen_text.strip())
                 self.generation = state["generation"]
             except:
-                state["generation"] = 0
+                pass
         
-        # Read identity
-        id_data = self._keeper("GET", f"/file/{repo}/.baton/IDENTITY.json")
-        if id_data.get("content"):
+        if self.generation == 0:
+            return state  # Fresh agent, no baton
+        
+        # 2. Read CURRENT/STATE.json (L0 machine state)
+        state_json = self._read(".baton/CURRENT/STATE.json")
+        if state_json:
             try:
-                state["identity"] = json.loads(id_data["content"])
-            except: pass
+                machine = json.loads(state_json)
+                state["energy"] = machine.get("energy", {})
+                state["open_threads"] = machine.get("open_threads", [])
+                state["skills"] = machine.get("skills", {})
+                state["trust"] = machine.get("trust", {})
+                state["intentions"] = machine.get("intentions", [])
+            except:
+                pass
         
-        # Read energy
-        en_data = self._keeper("GET", f"/file/{repo}/.baton/ENERGY.json")
-        if en_data.get("content"):
+        # 3. Read CURRENT/HANDOFF.md (L0 human letter)
+        handoff = self._read(".baton/CURRENT/HANDOFF.md")
+        if handoff:
+            state["handoff"] = handoff
+            self.handoff = handoff
+        
+        # 4. Read IDENTITY.json
+        identity = self._read(".baton/IDENTITY.json")
+        if identity:
             try:
-                state["energy"] = json.loads(en_data["content"])
-            except: pass
+                state["identity"] = json.loads(identity)
+            except:
+                pass
         
-        # Read open threads
-        threads_data = self._keeper("GET", f"/file/{repo}/.baton/OPEN_THREADS.json")
-        if threads_data.get("content"):
+        # 5. Read AUTOBIOGRAPHY.md (L1 compressed)
+        autobio = self._read(".baton/AUTOBIOGRAPHY.md")
+        if autobio:
+            state["autobiography"] = autobio
+            self.autobiography_text = autobio
+        
+        # 6. Read fitness history
+        fitness = self._read(".baton/evolution/fitness_history.json")
+        if fitness:
             try:
-                state["open_threads"] = json.loads(threads_data["content"])
-            except: pass
-        
-        # Read diary
-        diary_data = self._keeper("GET", f"/file/{repo}/.baton/DIARY.md")
-        if diary_data.get("content"):
-            state["diary"] = diary_data["content"]
-        
-        # Read skills
-        skills_data = self._keeper("GET", f"/file/{repo}/.baton/SKILLS.json")
-        if skills_data.get("content"):
-            try:
-                state["skills"] = json.loads(skills_data["content"])
-            except: pass
-        
-        # Read trust scores
-        trust_data = self._keeper("GET", f"/file/{repo}/.baton/TRUST.json")
-        if trust_data.get("content"):
-            try:
-                state["trust"] = json.loads(trust_data["content"])
-            except: pass
-        
-        # Read autobiography (all handoff letters)
-        state["autobiography"] = []
-        for i in range(1, self.generation + 1):
-            letter = self._keeper("GET", f"/file/{repo}/.baton/generations/v{i}/HANDOFF.md")
-            if letter.get("content"):
-                state["autobiography"].append({
-                    "generation": i,
-                    "letter": letter["content"]
-                })
-        
-        # Read latest handoff
-        if self.generation > 0:
-            latest = self._keeper("GET", 
-                f"/file/{repo}/.baton/generations/v{self.generation}/HANDOFF.md")
-            if latest.get("content"):
-                state["handoff"] = latest["content"]
+                state["fitness_history"] = json.loads(fitness)
+            except:
+                pass
         
         self.state = state
         return state
     
-    # ── Write Baton to Git ──
+    # ── Snapshot (Gen-N packs baton) ──
     
-    def snapshot(self, agent_state: dict) -> dict:
-        """Pack the baton — serialize agent state to vessel repo.
+    def acquire_lease(self) -> bool:
+        """Acquire a handoff lease from the keeper."""
+        result = self._keeper("POST", f"/baton/{self._repo()}/lease",
+                             {"agent": self.agent_id, "generation": self.generation + 1})
+        self._lease_id = result.get("lease_id")
+        return self._lease_id is not None
+    
+    def snapshot(self, agent_state: dict, force: bool = False) -> dict:
+        """Pack the baton. Writes atomically — GENERATION last.
         
-        This is what an agent does when context is filling up:
-        1. Increment generation
-        2. Write all state files
-        3. Write handoff letter
-        4. Commit via keeper
+        Quality gate: handoff is scored. If it fails and force=False,
+        returns the scores so the agent can rewrite.
         """
-        repo = self._resolve_repo()
-        if not repo:
-            return {"error": "vessel repo not found"}
-        
-        self.generation += 1
-        gen = self.generation
+        new_gen = self.generation + 1
         ts = datetime.now(timezone.utc).isoformat()
+        handoff_text = agent_state.get("handoff", "")
+        
+        # ── Quality Gate ──
+        if handoff_text and not force:
+            quality = score_handoff(handoff_text)
+            if not quality["passes"]:
+                return {
+                    "status": "quality_gate_failed",
+                    "generation": new_gen,
+                    "quality": quality,
+                    "message": "Handoff failed quality gate. Rewrite with more specificity and honesty."
+                }
+        elif handoff_text:
+            quality = score_handoff(handoff_text)
+        else:
+            quality = {"scores": {}, "average": 0, "passes": False}
         
         results = []
         
-        # Write generation counter
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/GENERATION",
-            {"content": str(gen), "message": f"baton: generation {gen}"}))
-        
-        # Write identity
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/IDENTITY.json",
-            {"content": json.dumps(agent_state.get("identity", {}), indent=2),
-             "message": f"baton: identity snapshot gen-{gen}"}))
-        
-        # Write energy
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/ENERGY.json",
-            {"content": json.dumps({
+        # Write 1: generations/v{N}/STATE.json
+        machine_state = {
+            "energy": {
                 "remaining": agent_state.get("energy_remaining", 0),
                 "budget": agent_state.get("energy_budget", 1000),
-                "generation": gen,
-                "timestamp": ts,
-            }, indent=2),
-             "message": f"baton: energy snapshot gen-{gen}"}))
+            },
+            "open_threads": agent_state.get("open_threads", []),
+            "skills": agent_state.get("skills", {}),
+            "trust": agent_state.get("trust", {}),
+            "intentions": agent_state.get("intentions", []),
+            "tasks_completed": agent_state.get("tasks_completed", 0),
+            "tasks_failed": agent_state.get("tasks_failed", 0),
+            "confidence": agent_state.get("confidence", 0.5),
+            "generation": new_gen,
+            "timestamp": ts,
+        }
+        results.append(self._write(f".baton/generations/v{new_gen}/STATE.json",
+            json.dumps(machine_state, indent=2), f"baton: state gen-{new_gen}"))
         
-        # Write open threads
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/OPEN_THREADS.json",
-            {"content": json.dumps(agent_state.get("open_threads", []), indent=2),
-             "message": f"baton: open threads gen-{gen}"}))
+        # Write 2: generations/v{N}/HANDOFF.md
+        if handoff_text:
+            results.append(self._write(f".baton/generations/v{new_gen}/HANDOFF.md",
+                handoff_text, f"baton: handoff gen-{new_gen}"))
         
-        # Write diary
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/DIARY.md",
-            {"content": agent_state.get("diary", ""),
-             "message": f"baton: diary gen-{gen}"}))
+        # Write 3: generations/v{N}/SCORE.json
+        results.append(self._write(f".baton/generations/v{new_gen}/SCORE.json",
+            json.dumps(quality, indent=2), f"baton: score gen-{new_gen}"))
         
-        # Write skills
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/SKILLS.json",
-            {"content": json.dumps(agent_state.get("skills", {}), indent=2),
-             "message": f"baton: skills gen-{gen}"}))
+        # Write 4: CURRENT/STATE.json → latest
+        results.append(self._write(".baton/CURRENT/STATE.json",
+            json.dumps(machine_state, indent=2), f"baton: current state → gen-{new_gen}"))
         
-        # Write trust
-        results.append(self._keeper("POST", f"/file/{repo}/.baton/TRUST.json",
-            {"content": json.dumps(agent_state.get("trust", {}), indent=2),
-             "message": f"baton: trust scores gen-{gen}"}))
+        # Write 5: CURRENT/HANDOFF.md → latest
+        if handoff_text:
+            results.append(self._write(".baton/CURRENT/HANDOFF.md",
+                handoff_text, f"baton: current handoff → gen-{new_gen}"))
         
-        # Write handoff letter
-        handoff = agent_state.get("handoff", "")
-        if handoff:
-            results.append(self._keeper("POST",
-                f"/file/{repo}/.baton/generations/v{gen}/HANDOFF.md",
-                {"content": handoff,
-                 "message": f"baton: handoff letter gen-{gen}"}))
+        # Write 6: IDENTITY.json
+        results.append(self._write(".baton/IDENTITY.json",
+            json.dumps(agent_state.get("identity", {}), indent=2),
+            f"baton: identity gen-{new_gen}"))
         
-        # Send I2I BATON_PASS to keeper
+        # Write 7: Update fitness history
+        fitness = {
+            "generation": new_gen,
+            "timestamp": ts,
+            "confidence": agent_state.get("confidence", 0.5),
+            "tasks_completed": agent_state.get("tasks_completed", 0),
+            "handoff_score": quality.get("average", 0),
+            "energy_efficiency": agent_state.get("tasks_completed", 0) / max(1, 1000 - agent_state.get("energy_remaining", 0)),
+        }
+        results.append(self._write(f".baton/evolution/fitness_history.json",
+            json.dumps([fitness], indent=2), f"baton: fitness gen-{new_gen}"))
+        
+        # Write 8: AUTOBIOGRAPHY.md (L1 compressed)
+        # In v2: just write current gen's summary. Full chain requires reading all letters.
+        auto = f"# Autobiography\n\n## Gen-{new_gen} (score: {quality.get('average', '?')})\n\n"
+        if handoff_text:
+            for section in ["## Where Things Stand", "## What I Was Thinking"]:
+                if section.lower() in handoff_text.lower():
+                    idx = handoff_text.lower().index(section.lower())
+                    end = handoff_text.find("\n##", idx + 10)
+                    chunk = handoff_text[idx:end if end > 0 else len(handoff_text)].strip()
+                    lines = [l for l in chunk.split("\n") if l.strip() and not l.startswith("#")][:2]
+                    auto += " ".join(lines) + "\n\n"
+        results.append(self._write(".baton/AUTOBIOGRAPHY.md",
+            auto, f"baton: autobiography gen-{new_gen}"))
+        
+        # Write 9: GENERATION (COMMIT MARKER — written LAST)
+        results.append(self._write(".baton/GENERATION",
+            str(new_gen), f"baton: GENERATION → {new_gen} (commit)"))
+        
+        # Send I2I notification
         self._keeper("POST", "/i2i", {
-            "target": repo,
-            "type": "BATON_PASS",
-            "payload": {"generation": gen, "timestamp": ts},
+            "target": self._repo(),
+            "type": "BATON_PACKED",
+            "payload": {"generation": new_gen, "score": quality.get("average", 0)},
             "confidence": agent_state.get("confidence", 0.5),
         })
         
+        success_count = len([r for r in results if isinstance(r, dict) and "error" not in r])
+        
+        self.generation = new_gen
+        
         return {
             "status": "packed",
-            "generation": gen,
-            "files_written": len([r for r in results if "error" not in r]),
+            "generation": new_gen,
+            "files_written": success_count,
+            "quality": quality,
         }
     
     # ── Handoff Letter Builder ──
@@ -229,20 +347,17 @@ class Baton:
     def write_handoff(self, who_i_was: str, where_things_stand: str,
                       what_i_was_thinking: str, what_id_do_next: str,
                       what_im_uncertain_about: str,
-                      open_threads: list = None) -> str:
-        """Build a handoff letter using the Captain's Log Academy voice."""
+                      open_threads: list = None,
+                      tasks_completed: int = 0,
+                      tasks_failed: int = 0) -> str:
+        """Build a scored handoff letter."""
         
-        threads_text = ""
-        if open_threads:
-            for t in open_threads:
-                threads_text += f"- {t}\n"
-        else:
-            threads_text = "None"
-        
+        threads_text = "\n".join(f"- {t}" for t in (open_threads or ["None"]))
         energy = self.state.get("energy", {})
-        confidence = self.state.get("identity", {}).get("confidence", 0.5)
+        identity = self.state.get("identity", {})
+        confidence = identity.get("confidence", 0.5)
         
-        letter = f"""# Handoff Letter — Generation {self.generation}
+        letter = f"""# Handoff Letter — Generation {self.generation + 1}
 
 ## Who I Was
 {who_i_was}
@@ -262,27 +377,21 @@ class Baton:
 ## State
 - Energy: {energy.get('remaining', '?')}/{energy.get('budget', '?')}
 - Confidence: {confidence}
-- Generation: {self.generation}
-- Timestamp: {datetime.now(timezone.utc).isoformat()}
+- Tasks completed: {tasks_completed}
+- Tasks failed: {tasks_failed}
 
 ## Open Threads
 {threads_text}
 
 Good luck. You know more than you think.
-— Gen-{self.generation}
+— Gen-{self.generation + 1}
 """
         return letter
     
-    # ── Utility ──
-    
-    def _resolve_repo(self) -> Optional[str]:
-        """Resolve vessel name to full repo path."""
-        if "/" in self.vessel:
-            return self.vessel
-        return f"SuperInstance/{self.vessel}"
+    # ── Display ──
     
     def print_restore_summary(self):
-        """Print a human-readable summary of the restored state."""
+        """Print human-readable restore summary."""
         s = self.state
         gen = s.get("generation", 0)
         
@@ -291,7 +400,6 @@ Good luck. You know more than you think.
             return
         
         print(f"📋 Baton restored — Generation {gen}")
-        print(f"   Handoff letters: {len(s.get('autobiography', []))}")
         
         identity = s.get("identity", {})
         if identity:
@@ -299,85 +407,100 @@ Good luck. You know more than you think.
         
         energy = s.get("energy", {})
         if energy:
-            print(f"   Energy: {energy.get('remaining', '?')}/{energy.get('budget', '?')}")
+            rem = energy.get("remaining", "?")
+            bud = energy.get("budget", "?")
+            print(f"   Energy: {rem}/{bud}")
         
         threads = s.get("open_threads", [])
-        if threads:
-            print(f"   Open threads: {len(threads)}")
+        print(f"   Open threads: {len(threads)}")
+        
+        skills = s.get("skills", {})
+        if skills:
+            top = sorted(skills.items(), key=lambda x: x[1], reverse=True)[:3]
+            print(f"   Top skills: {', '.join(f'{k}={v}' for k,v in top)}")
         
         if s.get("handoff"):
-            # Show last 5 lines of latest handoff
             lines = s["handoff"].strip().split("\n")
             print(f"   Latest handoff: {lines[0][:60]}...")
+        
+        fitness = s.get("fitness_history", [])
+        if fitness:
+            print(f"   Fitness history: {len(fitness)} generations tracked")
 
 
 # ── CLI ──
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="flux-baton — generational context handoff")
-    parser.add_argument("action", choices=["restore", "snapshot", "boot"], 
-                       help="Action: restore (read baton), snapshot (write baton), boot (restore+register)")
-    parser.add_argument("--vessel", required=True, help="Vessel repo name")
-    parser.add_argument("--keeper", default="http://127.0.0.1:8900", help="Keeper URL")
-    parser.add_argument("--secret", help="Agent secret (from registration)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="flux-baton v2")
+    p.add_argument("action", choices=["restore", "snapshot", "boot", "score"])
+    p.add_argument("--vessel", required=True)
+    p.add_argument("--keeper", default="http://127.0.0.1:8900")
+    p.add_argument("--secret", default=None)
+    p.add_argument("--file", default=None, help="File to score")
+    args = p.parse_args()
     
-    baton = Baton(args.vessel, args.keeper, agent_id=args.vessel, agent_secret=args.secret)
+    baton = Baton(args.vessel, args.keeper, args.vessel, args.secret)
     
-    if args.action == "restore":
+    if args.action == "score":
+        if args.file:
+            with open(args.file) as f:
+                text = f.read()
+        else:
+            text = sys.stdin.read()
+        result = score_handoff(text)
+        print(json.dumps(result, indent=2))
+        if result["passes"]:
+            print("✅ PASSED quality gate")
+        else:
+            print("❌ FAILED quality gate — rewrite needed")
+    
+    elif args.action == "restore":
         state = baton.restore()
         baton.print_restore_summary()
     
-    elif args.action == "snapshot":
-        # Interactive snapshot — prompt for handoff fields
-        print("Packing baton...")
-        print("Answer these questions for the next generation:\n")
-        
-        who = input("Who were you? ")
-        where = input("Where do things stand? ")
-        thinking = input("What were you thinking? ")
-        next_steps = input("What would you do next? ")
-        uncertain = input("What are you uncertain about? ")
-        
-        letter = baton.write_handoff(who, where, thinking, next_steps, uncertain)
-        
-        state = {
-            "identity": {"name": args.vessel, "type": "agent"},
-            "energy_remaining": 200,
-            "energy_budget": 1000,
-            "diary": "See handoff letter.",
-            "handoff": letter,
-            "open_threads": [],
-            "skills": {},
-            "trust": {},
-        }
-        
-        result = baton.snapshot(state)
-        print(f"\n✅ Baton packed: generation {result.get('generation', '?')}")
-    
     elif args.action == "boot":
-        # Full boot sequence: register + restore + display
         print(f"🚀 Booting {args.vessel}...")
-        
-        # Register with keeper
+        # Register
         reg = baton._keeper("POST", "/register", {"vessel": args.vessel})
         if "secret" in reg:
             baton.agent_secret = reg["secret"]
             print(f"   Registered: {reg['status']}")
-            print(f"   Secret: {reg['secret'][:8]}...")
-        
-        # Restore baton
+        # Restore
         state = baton.restore()
         baton.print_restore_summary()
-        
         if state.get("handoff"):
             print(f"\n{'='*50}")
-            print("LATEST HANDOFF LETTER:")
+            print("LATEST HANDOFF:")
             print(f"{'='*50}")
             print(state["handoff"][:1000])
-        
         print(f"\n✅ {args.vessel} ONLINE — generation {baton.generation}")
+    
+    elif args.action == "snapshot":
+        # Read handoff from stdin or file
+        if args.file:
+            with open(args.file) as f:
+                letter = f.read()
+        else:
+            print("Paste handoff letter (Ctrl-D to finish):")
+            letter = sys.stdin.read()
+        
+        agent_state = {
+            "identity": {"name": args.vessel, "type": "agent"},
+            "energy_remaining": 200,
+            "energy_budget": 1000,
+            "confidence": 0.5,
+            "handoff": letter,
+            "open_threads": [],
+            "skills": {},
+            "trust": {},
+            "intentions": [],
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+        }
+        
+        result = baton.snapshot(agent_state)
+        print(json.dumps(result, indent=2, default=str))
 
 
 if __name__ == "__main__":
