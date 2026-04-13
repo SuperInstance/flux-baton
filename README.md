@@ -1,5 +1,6 @@
 # flux-baton — Generational Context Handoff for FLUX-Native Agents
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 > *An agent's work outlives its context window. The baton carries everything the next agent needs.*
 
 ## What This Is
