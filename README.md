@@ -1,9 +1,8 @@
 # FLUX Baton
 Generational context handoff for agents made easy.
 
-[![Build Status](https://img.shields.io/travis/SuperInstance/flux-baton)](https://travis-ci.org/SuperInstance/flux-baton)
-[![License](https://img.shields.io/github/license/SuperInstance/flux-baton)](https://github.com/SuperInstance/flux-baton/blob/master/LICENSE)
-[![Fleet Status](https://img.shields.io/badge/fleet-status-active)](https://github.com/SuperInstance/flux-baton)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+> *An agent's work outlives its context window. The baton carries everything the next agent needs.*
 
 * Enables seamless handoff between agent generations
 * Implements quality gates for ensured consistency
